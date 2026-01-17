@@ -1,0 +1,76 @@
+# Основные зависимости
+Flask
+Flask-CORS
+Jinja2
+Werkzeug
+
+# Обработка данных
+numpy
+pandas
+Pillow
+opencv-python
+
+# Конфигурация
+PyYAML
+python-dotenv
+
+# Работа с видео/аудио
+moviepy
+pydub
+imageio
+imageio-ffmpeg
+
+# Базы данных
+SQLAlchemy
+alembic
+
+# Мониторинг и метрики
+psutil
+prometheus-client
+
+# API клиенты
+requests
+aiohttp
+
+# AI/ML инструменты (опционально)
+transformers
+diffusers
+torch
+torchvision
+
+# Утилиты
+tqdm
+colorama
+python-magic
+
+# Безопасность
+bcrypt
+cryptography
+
+# Планирование задач
+APScheduler
+schedule
+
+# Веб интерфейс (дополнительно)
+Flask-SocketIO
+Flask-Login
+Flask-WTF
+
+# Документация
+Sphinx
+sphinx-rtd-theme
+
+# Тестирование
+pytest
+pytest-cov
+
+# Логирование
+loguru
+structlog
+
+# Системные утилиты
+click
+rich
+
+# Дополнительные кодексы для аудио/видео
+# Для работы с дополнительными форматами
