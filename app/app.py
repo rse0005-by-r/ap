@@ -1,883 +1,1055 @@
 #!/usr/bin/env python3
 """
-Media Automation System для развертывания на Nginx + Gunicorn
-Production версия
+Media Automation System с просмотром медиафайлов
 """
 
-from flask import Flask, jsonify, request, send_from_directory
+from flask import Flask, jsonify, request, send_from_directory, render_template_string, Response
 import json
 import os
-import sys
 import time
 import threading
+import random
 from datetime import datetime
 from pathlib import Path
-import logging
+import mimetypes
+from werkzeug.utils import secure_filename
 
 # ==================== НАСТРОЙКИ ====================
 app = Flask(__name__)
-app.config['SECRET_KEY'] = os.getenv('SECRET_KEY', 'production-secret-key-2024')
-
-# Настройка логирования
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('media_automation.log'),
-        logging.StreamHandler(sys.stdout)
-    ]
-)
-logger = logging.getLogger(__name__)
-
-# Пути
-BASE_DIR = Path(__file__).parent
-DATA_DIR = BASE_DIR / "data"
-STATIC_DIR = BASE_DIR / "static"
-UPLOADS_DIR = DATA_DIR / "uploads"
-OUTPUTS_DIR = DATA_DIR / "outputs"
+app.config['SECRET_KEY'] = 'media-viewer-key-2024'
+app.config['MAX_CONTENT_LENGTH'] = 100 * 1024 * 1024  # 100MB
+app.config['UPLOAD_FOLDER'] = 'data/uploads'
+app.config['OUTPUT_FOLDER'] = 'data/outputs'
+app.config['ALLOWED_EXTENSIONS'] = {'png', 'jpg', 'jpeg', 'gif', 'mp4', 'mov', 'avi', 'webm'}
 
 # Создаем папки
-for folder in [DATA_DIR, STATIC_DIR, UPLOADS_DIR, OUTPUTS_DIR]:
-    folder.mkdir(exist_ok=True)
+BASE_DIR = Path(__file__).parent
+for folder in ['static/images', 'static/videos', 'static/thumbnails', 
+               'data/uploads', 'data/outputs/images', 'data/outputs/videos']:
+    (BASE_DIR / folder).mkdir(parents=True, exist_ok=True)
 
-# JSON база данных
-class TaskManager:
+# ==================== МОДЕЛЬ ДАННЫХ ====================
+
+class MediaDatabase:
+    """База данных для медиафайлов"""
+    
     def __init__(self):
-        self.db_file = DATA_DIR / "tasks_db.json"
-        self.tasks = self._load_db()
-        self.lock = threading.Lock()
+        self.db_file = BASE_DIR / 'data' / 'media_db.json'
+        self.media = self._load_db()
     
     def _load_db(self):
         if self.db_file.exists():
             try:
                 with open(self.db_file, 'r', encoding='utf-8') as f:
                     return json.load(f)
-            except Exception as e:
-                logger.error(f"Ошибка загрузки БД: {e}")
-                return {"tasks": [], "next_id": 1, "stats": {}}
-        return {"tasks": [], "next_id": 1, "stats": {}}
+            except:
+                return {"media": [], "next_id": 1}
+        return {"media": [], "next_id": 1}
     
     def _save_db(self):
-        try:
-            with open(self.db_file, 'w', encoding='utf-8') as f:
-                json.dump(self.tasks, f, ensure_ascii=False, indent=2)
-        except Exception as e:
-            logger.error(f"Ошибка сохранения БД: {e}")
+        with open(self.db_file, 'w', encoding='utf-8') as f:
+            json.dump(self.media, f, ensure_ascii=False, indent=2)
     
-    def create_task(self, name, task_type="image", description=""):
-        with self.lock:
-            task_id = self.tasks["next_id"]
-            
-            task = {
-                "id": task_id,
-                "name": name,
-                "type": task_type,
-                "description": description,
-                "status": "pending",
-                "progress": 0,
-                "steps": [],
-                "created_at": datetime.now().isoformat(),
-                "updated_at": datetime.now().isoformat(),
-                "result": None,
-                "output_path": None
-            }
-            
-            self.tasks["tasks"].append(task)
-            self.tasks["next_id"] += 1
-            
-            # Обновляем статистику
-            if "stats" not in self.tasks:
-                self.tasks["stats"] = {}
-            if task_type not in self.tasks["stats"]:
-                self.tasks["stats"][task_type] = 0
-            self.tasks["stats"][task_type] += 1
-            
-            self._save_db()
-            logger.info(f"Создана задача #{task_id}: {name}")
-            
-            # Запускаем в фоне
-            self._start_task_processing(task_id)
-            
-            return task
-    
-    def _start_task_processing(self, task_id):
-        """Запуск обработки задачи в фоне"""
-        def process():
-            time.sleep(1)
-            self.update_task(task_id, status="running", progress=10)
-            
-            # Симуляция различных этапов
-            steps = [
-                ("Анализ запроса", 20),
-                ("Генерация промпта", 35),
-                ("Создание изображений", 60),
-                ("Апскейл", 80),
-                ("Создание видео", 95),
-                ("Финальная обработка", 100)
-            ]
-            
-            for step_name, progress in steps:
-                time.sleep(2)
-                self.update_task(
-                    task_id,
-                    progress=progress,
-                    steps=[*self.get_task(task_id).get("steps", []), step_name]
-                )
-            
-            self.update_task(
-                task_id,
-                status="completed",
-                result={
-                    "message": "Задача успешно выполнена",
-                    "images_generated": 4,
-                    "video_created": True,
-                    "output_path": f"/outputs/task_{task_id}.mp4"
-                },
-                output_path=f"/data/outputs/task_{task_id}.mp4"
-            )
-            logger.info(f"Задача #{task_id} завершена")
+    def add_media(self, filename, media_type, description=""):
+        """Добавление медиафайла в базу"""
+        media_id = self.media["next_id"]
         
-        thread = threading.Thread(target=process, daemon=True)
-        thread.start()
+        # Определяем тип файла
+        ext = filename.split('.')[-1].lower()
+        if ext in ['jpg', 'jpeg', 'png', 'gif', 'webp']:
+            file_type = 'image'
+            thumbnail = f'/static/thumbnails/{media_id}.jpg'
+            preview_url = f'/media/preview/{media_id}'
+        elif ext in ['mp4', 'mov', 'avi', 'webm']:
+            file_type = 'video'
+            thumbnail = f'/static/thumbnails/{media_id}.jpg'
+            preview_url = f'/media/player/{media_id}'
+        else:
+            file_type = 'document'
+            thumbnail = None
+            preview_url = None
+        
+        media_item = {
+            "id": media_id,
+            "filename": filename,
+            "type": file_type,
+            "media_type": media_type,  # original/generated/upscaled
+            "description": description,
+            "path": f"/data/uploads/{filename}",
+            "thumbnail": thumbnail,
+            "preview_url": preview_url,
+            "created_at": datetime.now().isoformat(),
+            "size": "1920x1080",
+            "status": "active"
+        }
+        
+        self.media["media"].append(media_item)
+        self.media["next_id"] += 1
+        self._save_db()
+        
+        # Создаем тестовую миниатюру
+        self._create_test_thumbnail(media_id)
+        
+        return media_item
     
-    def update_task(self, task_id, **kwargs):
-        with self.lock:
-            for task in self.tasks["tasks"]:
-                if task["id"] == task_id:
-                    task.update(kwargs)
-                    task["updated_at"] = datetime.now().isoformat()
-                    self._save_db()
-                    return True
-            return False
+    def _create_test_thumbnail(self, media_id):
+        """Создание тестовой миниатюры (заглушка)"""
+        import random
+        colors = ['#FF6B6B', '#4ECDC4', '#45B7D1', '#96CEB4', '#FFEAA7']
+        color = random.choice(colors)
+        
+        # В реальном приложении здесь будет генерация реальной миниатюры
+        thumb_path = BASE_DIR / 'static' / 'thumbnails' / f'{media_id}.jpg'
+        
+        # Создаем простой SVG как заглушку
+        svg_content = f'''<?xml version="1.0" encoding="UTF-8"?>
+        <svg width="300" height="200" xmlns="http://www.w3.org/2000/svg">
+            <rect width="300" height="200" fill="{color}"/>
+            <text x="150" y="100" font-family="Arial" font-size="24" 
+                  fill="white" text-anchor="middle" dominant-baseline="middle">
+                Preview {media_id}
+            </text>
+            <text x="150" y="130" font-family="Arial" font-size="14" 
+                  fill="white" text-anchor="middle" dominant-baseline="middle">
+                1920x1080
+            </text>
+        </svg>'''
+        
+        with open(thumb_path, 'w', encoding='utf-8') as f:
+            f.write(svg_content)
     
-    def get_task(self, task_id):
-        for task in self.tasks["tasks"]:
-            if task["id"] == task_id:
-                return task
+    def get_media(self, media_id):
+        """Получение медиафайла по ID"""
+        for item in self.media["media"]:
+            if item["id"] == media_id:
+                return item
         return None
     
-    def get_all_tasks(self, limit=50):
-        tasks = sorted(self.tasks["tasks"], 
-                      key=lambda x: x["created_at"], 
-                      reverse=True)
-        return tasks[:limit]
+    def get_all_media(self, media_type=None):
+        """Получение всех медиафайлов"""
+        if media_type:
+            return [m for m in self.media["media"] if m["type"] == media_type]
+        return self.media["media"]
     
-    def get_stats(self):
-        stats = {
-            "total_tasks": len(self.tasks["tasks"]),
-            "completed": len([t for t in self.tasks["tasks"] if t["status"] == "completed"]),
-            "running": len([t for t in self.tasks["tasks"] if t["status"] == "running"]),
-            "pending": len([t for t in self.tasks["tasks"] if t["status"] == "pending"]),
-            "by_type": self.tasks.get("stats", {})
+    def search_media(self, query):
+        """Поиск медиафайлов"""
+        results = []
+        query = query.lower()
+        for item in self.media["media"]:
+            if (query in item["description"].lower() or 
+                query in item["filename"].lower()):
+                results.append(item)
+        return results
+
+# Инициализация базы данных
+db = MediaDatabase()
+
+# ==================== HTML ИНТЕРФЕЙС ====================
+
+HTML_TEMPLATE = '''
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Media Automation - Просмотр медиа</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <style>
+        :root {
+            --primary: #4361ee;
+            --secondary: #3a0ca3;
+            --success: #4cc9f0;
         }
-        return stats
-
-# Инициализация менеджера задач
-task_manager = TaskManager()
-
-# ==================== ВЕБ-ИНТЕРФЕЙС ====================
-
-@app.route('/')
-def index():
-    """Главная страница"""
-    return '''
-    <!DOCTYPE html>
-    <html lang="ru">
-    <head>
-        <meta charset="UTF-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>Media Automation - Production</title>
-        <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
-        <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
-        <style>
-            :root {
-                --primary: #4361ee;
-                --secondary: #3a0ca3;
-                --success: #4cc9f0;
-                --dark: #1d3557;
-            }
-            body {
-                background: linear-gradient(135deg, #f5f7fa 0%, #c3cfe2 100%);
-                min-height: 100vh;
-                font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-            }
-            .navbar {
-                background: linear-gradient(90deg, var(--primary) 0%, var(--secondary) 100%);
-                box-shadow: 0 4px 20px rgba(0,0,0,0.1);
-            }
-            .card {
-                border-radius: 15px;
-                border: none;
-                box-shadow: 0 5px 20px rgba(0,0,0,0.08);
-                margin-bottom: 25px;
-                transition: transform 0.3s;
-            }
-            .card:hover {
-                transform: translateY(-5px);
-            }
-            .stat-card {
-                text-align: center;
-                padding: 25px 15px;
-            }
-            .stat-icon {
-                font-size: 2.5rem;
-                margin-bottom: 15px;
-                opacity: 0.8;
-            }
-            .progress {
-                height: 10px;
-                border-radius: 5px;
-            }
-            .task-item {
-                border-left: 4px solid var(--primary);
-                transition: all 0.3s;
-            }
-            .task-item:hover {
-                background-color: #f8f9fa;
-                transform: translateX(5px);
-            }
-            .step-badge {
-                font-size: 0.7rem;
-                padding: 3px 8px;
-                margin-right: 5px;
-                margin-bottom: 5px;
-            }
-            .server-status {
-                position: fixed;
-                bottom: 20px;
-                right: 20px;
-                z-index: 1000;
-            }
-        </style>
-    </head>
-    <body>
-        <!-- Навигация -->
-        <nav class="navbar navbar-expand-lg navbar-dark">
-            <div class="container">
-                <a class="navbar-brand" href="/">
-                    <i class="fas fa-robot me-2"></i>
-                    <strong>Media Automation</strong>
-                    <span class="badge bg-light text-dark ms-2">Production</span>
-                </a>
-                <div class="navbar-text">
-                    <i class="fas fa-server me-1"></i>
-                    <span id="serverStatus">Nginx + Flask</span>
+        body {
+            background: #f8f9fa;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+        }
+        .navbar {
+            background: linear-gradient(90deg, var(--primary) 0%, var(--secondary) 100%);
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }
+        .media-card {
+            border: none;
+            border-radius: 12px;
+            overflow: hidden;
+            box-shadow: 0 4px 15px rgba(0,0,0,0.08);
+            transition: all 0.3s ease;
+            height: 100%;
+        }
+        .media-card:hover {
+            transform: translateY(-8px);
+            box-shadow: 0 8px 25px rgba(0,0,0,0.15);
+        }
+        .media-thumbnail {
+            width: 100%;
+            height: 200px;
+            object-fit: cover;
+            background: linear-gradient(45deg, #667eea, #764ba2);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: white;
+            font-size: 24px;
+        }
+        .media-icon {
+            font-size: 48px;
+            opacity: 0.8;
+        }
+        .media-badge {
+            position: absolute;
+            top: 10px;
+            right: 10px;
+            z-index: 2;
+        }
+        .media-actions {
+            position: absolute;
+            bottom: 10px;
+            right: 10px;
+            opacity: 0;
+            transition: opacity 0.3s;
+        }
+        .media-card:hover .media-actions {
+            opacity: 1;
+        }
+        .modal-fullscreen {
+            max-width: 95vw;
+            max-height: 95vh;
+        }
+        .modal-content {
+            border-radius: 15px;
+            overflow: hidden;
+        }
+        .media-preview {
+            max-width: 100%;
+            max-height: 70vh;
+            object-fit: contain;
+        }
+        .tab-content {
+            padding: 20px 0;
+        }
+        .upload-area {
+            border: 3px dashed #dee2e6;
+            border-radius: 15px;
+            padding: 40px;
+            text-align: center;
+            cursor: pointer;
+            transition: all 0.3s;
+        }
+        .upload-area:hover {
+            border-color: var(--primary);
+            background-color: rgba(67, 97, 238, 0.05);
+        }
+        .upload-icon {
+            font-size: 48px;
+            color: #6c757d;
+            margin-bottom: 20px;
+        }
+    </style>
+</head>
+<body>
+    <!-- Навигация -->
+    <nav class="navbar navbar-expand-lg navbar-dark">
+        <div class="container">
+            <a class="navbar-brand" href="/">
+                <i class="fas fa-photo-video me-2"></i>
+                <strong>Media Automation</strong>
+            </a>
+            <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#navbarNav">
+                <span class="navbar-toggler-icon"></span>
+            </button>
+            <div class="collapse navbar-collapse" id="navbarNav">
+                <ul class="navbar-nav me-auto">
+                    <li class="nav-item">
+                        <a class="nav-link active" href="#" onclick="showTab('gallery')">
+                            <i class="fas fa-th-large me-1"></i> Галерея
+                        </a>
+                    </li>
+                    <li class="nav-item">
+                        <a class="nav-link" href="#" onclick="showTab('upload')">
+                            <i class="fas fa-upload me-1"></i> Загрузить
+                        </a>
+                    </li>
+                    <li class="nav-item">
+                        <a class="nav-link" href="#" onclick="showTab('generate')">
+                            <i class="fas fa-robot me-1"></i> Сгенерировать
+                        </a>
+                    </li>
+                </ul>
+                <div class="navbar-text text-white">
+                    <i class="fas fa-database me-1"></i>
+                    <span id="mediaCount">0</span> файлов
                 </div>
             </div>
-        </nav>
+        </div>
+    </nav>
 
-        <!-- Основной контент -->
-        <div class="container mt-4">
-            <!-- Заголовок -->
+    <!-- Основной контент -->
+    <div class="container mt-4">
+        <!-- Табы -->
+        <div class="mb-4">
+            <ul class="nav nav-tabs" id="mediaTabs">
+                <li class="nav-item">
+                    <button class="nav-link active" onclick="showTab('gallery')">
+                        <i class="fas fa-th-large me-2"></i>Галерея медиа
+                    </button>
+                </li>
+                <li class="nav-item">
+                    <button class="nav-link" onclick="showTab('upload')">
+                        <i class="fas fa-upload me-2"></i>Загрузка файлов
+                    </button>
+                </li>
+                <li class="nav-item">
+                    <button class="nav-link" onclick="showTab('generate')">
+                        <i class="fas fa-magic me-2"></i>Генерация контента
+                    </button>
+                </li>
+            </ul>
+        </div>
+
+        <!-- Вкладка галереи -->
+        <div id="galleryTab" class="tab-content">
             <div class="row mb-4">
-                <div class="col-12">
-                    <div class="card bg-white">
-                        <div class="card-body">
-                            <h1 class="display-5 mb-3">🎬 Система автоматической генерации контента</h1>
-                            <p class="lead mb-0">Production версия с Nginx и многопоточной обработкой</p>
-                        </div>
+                <div class="col-md-6">
+                    <h3><i class="fas fa-images me-2"></i>Медиатека</h3>
+                </div>
+                <div class="col-md-6">
+                    <div class="input-group">
+                        <input type="text" class="form-control" id="searchMedia" 
+                               placeholder="Поиск по названию или описанию...">
+                        <button class="btn btn-primary" onclick="searchMedia()">
+                            <i class="fas fa-search"></i>
+                        </button>
                     </div>
                 </div>
             </div>
 
-            <!-- Статистика -->
-            <div class="row mb-4" id="statsRow">
-                <div class="col-md-3">
-                    <div class="card stat-card">
-                        <div class="text-primary stat-icon">
-                            <i class="fas fa-tasks"></i>
-                        </div>
-                        <h2 class="text-primary" id="totalTasks">0</h2>
-                        <p class="text-muted">Всего задач</p>
-                    </div>
-                </div>
-                <div class="col-md-3">
-                    <div class="card stat-card">
-                        <div class="text-success stat-icon">
-                            <i class="fas fa-check-circle"></i>
-                        </div>
-                        <h2 class="text-success" id="completedTasks">0</h2>
-                        <p class="text-muted">Завершено</p>
-                    </div>
-                </div>
-                <div class="col-md-3">
-                    <div class="card stat-card">
-                        <div class="text-info stat-icon">
-                            <i class="fas fa-sync-alt"></i>
-                        </div>
-                        <h2 class="text-info" id="runningTasks">0</h2>
-                        <p class="text-muted">В процессе</p>
-                    </div>
-                </div>
-                <div class="col-md-3">
-                    <div class="card stat-card">
-                        <div class="text-warning stat-icon">
-                            <i class="fas fa-chart-line"></i>
-                        </div>
-                        <h2 class="text-warning" id="successRate">0%</h2>
-                        <p class="text-muted">Успешность</p>
-                    </div>
-                </div>
-            </div>
-
-            <!-- Панель управления -->
             <div class="row">
-                <div class="col-lg-8">
+                <div class="col-md-3 mb-3">
+                    <div class="card media-card">
+                        <div class="card-body text-center">
+                            <div class="upload-icon">
+                                <i class="fas fa-plus-circle"></i>
+                            </div>
+                            <h5>Новый контент</h5>
+                            <p class="text-muted small">Добавить медиафайлы</p>
+                            <button class="btn btn-primary btn-sm" onclick="showTab('upload')">
+                                <i class="fas fa-plus me-1"></i>Добавить
+                            </button>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Сюда будут добавляться карточки медиа -->
+                <div id="mediaGallery" class="row">
+                    <!-- Карточки загружаются через JavaScript -->
+                </div>
+            </div>
+        </div>
+
+        <!-- Вкладка загрузки -->
+        <div id="uploadTab" class="tab-content" style="display: none;">
+            <div class="row justify-content-center">
+                <div class="col-md-8">
                     <div class="card">
-                        <div class="card-header bg-dark text-white">
-                            <h4 class="mb-0"><i class="fas fa-cogs me-2"></i>Создание новой задачи</h4>
+                        <div class="card-header bg-primary text-white">
+                            <h4 class="mb-0"><i class="fas fa-cloud-upload-alt me-2"></i>Загрузка медиафайлов</h4>
                         </div>
                         <div class="card-body">
-                            <div class="mb-3">
-                                <label class="form-label">Название задачи:</label>
-                                <input type="text" class="form-control" id="taskName" 
-                                       placeholder="Например: 'Генерация космического пейзажа'">
+                            <div class="upload-area" onclick="document.getElementById('fileInput').click()">
+                                <div class="upload-icon">
+                                    <i class="fas fa-cloud-upload-alt"></i>
+                                </div>
+                                <h4>Перетащите файлы сюда</h4>
+                                <p class="text-muted">или нажмите для выбора файлов</p>
+                                <p class="small text-muted">Поддерживаются: JPG, PNG, GIF, MP4, MOV</p>
                             </div>
                             
-                            <div class="mb-3">
-                                <label class="form-label">Подробное описание:</label>
-                                <textarea class="form-control" id="taskDescription" rows="4"
-                                          placeholder="Опишите детали. Система учтет ваши предпочтения..."></textarea>
+                            <input type="file" id="fileInput" multiple style="display: none;" 
+                                   onchange="handleFileSelect(this.files)">
+                            
+                            <div class="mt-4">
+                                <label class="form-label">Описание (опционально):</label>
+                                <textarea class="form-control" id="fileDescription" rows="3" 
+                                          placeholder="Опишите, что на изображении/видео..."></textarea>
+                            </div>
+                            
+                            <div class="mt-4">
+                                <label class="form-label">Тип контента:</label>
+                                <select class="form-select" id="mediaType">
+                                    <option value="reference">Пример (для обучения ИИ)</option>
+                                    <option value="generated">Сгенерированный контент</option>
+                                    <option value="upscaled">Апскейлированное</option>
+                                    <option value="final">Финальный результат</option>
+                                </select>
+                            </div>
+                            
+                            <div class="d-grid gap-2 mt-4">
+                                <button class="btn btn-success btn-lg" onclick="uploadFiles()">
+                                    <i class="fas fa-upload me-2"></i>Загрузить выбранные файлы
+                                </button>
+                            </div>
+                            
+                            <div id="uploadProgress" class="mt-4" style="display: none;">
+                                <div class="progress">
+                                    <div class="progress-bar progress-bar-striped progress-bar-animated" 
+                                         role="progressbar" style="width: 0%"></div>
+                                </div>
+                                <div class="text-center mt-2" id="uploadStatus"></div>
+                            </div>
+                            
+                            <div id="selectedFiles" class="mt-4"></div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Вкладка генерации -->
+        <div id="generateTab" class="tab-content" style="display: none;">
+            <div class="row justify-content-center">
+                <div class="col-md-8">
+                    <div class="card">
+                        <div class="card-header bg-success text-white">
+                            <h4 class="mb-0"><i class="fas fa-robot me-2"></i>Генерация контента</h4>
+                        </div>
+                        <div class="card-body">
+                            <div class="mb-4">
+                                <label class="form-label">Описание для генерации:</label>
+                                <textarea class="form-control" id="generatePrompt" rows="4"
+                                          placeholder="Опишите, что вы хотите сгенерировать. Например: 'Космический пейзаж с планетами в стиле научной фантастики'"></textarea>
                             </div>
                             
                             <div class="row mb-4">
                                 <div class="col-md-6">
                                     <label class="form-label">Тип контента:</label>
-                                    <select class="form-select" id="contentType">
-                                        <option value="image">Изображения (4 варианта)</option>
-                                        <option value="video">Видео из изображения</option>
-                                        <option value="full">Полный пайплайн</option>
+                                    <select class="form-select" id="generateType">
+                                        <option value="image">Изображение</option>
+                                        <option value="video">Видео</option>
                                     </select>
                                 </div>
                                 <div class="col-md-6">
-                                    <label class="form-label">Приоритет:</label>
-                                    <select class="form-select" id="taskPriority">
-                                        <option value="normal">Обычный</option>
-                                        <option value="high">Высокий</option>
-                                        <option value="urgent">Срочный</option>
+                                    <label class="form-label">Количество вариантов:</label>
+                                    <select class="form-select" id="generateCount">
+                                        <option value="1">1 вариант</option>
+                                        <option value="2">2 варианта</option>
+                                        <option value="4" selected>4 варианта</option>
+                                        <option value="8">8 вариантов</option>
                                     </select>
                                 </div>
                             </div>
                             
                             <div class="d-grid gap-2">
-                                <button class="btn btn-primary btn-lg" onclick="createNewTask()">
-                                    <i class="fas fa-rocket me-2"></i>Запустить задачу
-                                </button>
-                                <button class="btn btn-outline-secondary" onclick="loadAllTasks()">
-                                    <i class="fas fa-redo me-2"></i>Обновить список
+                                <button class="btn btn-success btn-lg" onclick="generateContent()">
+                                    <i class="fas fa-magic me-2"></i>Сгенерировать контент
                                 </button>
                             </div>
-                        </div>
-                    </div>
-
-                    <!-- Список задач -->
-                    <div class="card mt-4">
-                        <div class="card-header">
-                            <h4 class="mb-0"><i class="fas fa-list-ul me-2"></i>Активные задачи</h4>
-                        </div>
-                        <div class="card-body">
-                            <div id="tasksList">
-                                <div class="text-center py-5">
-                                    <div class="spinner-border text-primary" role="status">
-                                        <span class="visually-hidden">Загрузка...</span>
-                                    </div>
-                                    <p class="mt-3">Загрузка списка задач...</p>
-                                </div>
-                            </div>
-                        </div>
-                    </div>
-                </div>
-
-                <!-- Боковая панель -->
-                <div class="col-lg-4">
-                    <div class="card">
-                        <div class="card-header bg-info text-white">
-                            <h5 class="mb-0"><i class="fas fa-info-circle me-2"></i>Информация о системе</h5>
-                        </div>
-                        <div class="card-body">
-                            <div class="mb-3">
-                                <h6><i class="fas fa-server me-2"></i>Сервер</h6>
-                                <div class="small">
-                                    <div>Nginx + Flask + Gunicorn</div>
-                                    <div>Python 3.8+</div>
-                                </div>
-                            </div>
                             
-                            <div class="mb-3">
-                                <h6><i class="fas fa-database me-2"></i>База данных</h6>
-                                <div class="small">
-                                    <div>JSON файловая БД</div>
-                                    <div>Автосохранение</div>
+                            <div id="generateProgress" class="mt-4" style="display: none;">
+                                <div class="progress">
+                                    <div class="progress-bar progress-bar-striped progress-bar-animated bg-success" 
+                                         role="progressbar" style="width: 0%"></div>
                                 </div>
-                            </div>
-                            
-                            <div class="mb-3">
-                                <h6><i class="fas fa-bolt me-2"></i>Производительность</h6>
-                                <div class="small">
-                                    <div>Многопоточная обработка</div>
-                                    <div>Фоновые задачи</div>
-                                </div>
-                            </div>
-                            
-                            <hr>
-                            
-                            <div class="text-center">
-                                <button class="btn btn-sm btn-outline-danger" onclick="clearAllTasks()">
-                                    <i class="fas fa-trash me-1"></i>Очистить все задачи
-                                </button>
-                            </div>
-                        </div>
-                    </div>
-                    
-                    <div class="card mt-4">
-                        <div class="card-header">
-                            <h5 class="mb-0"><i class="fas fa-history me-2"></i>Последние действия</h5>
-                        </div>
-                        <div class="card-body">
-                            <div id="recentActivity" class="small">
-                                <div class="text-muted">Загрузка...</div>
+                                <div class="text-center mt-2" id="generateStatus"></div>
                             </div>
                         </div>
                     </div>
                 </div>
             </div>
         </div>
+    </div>
 
-        <!-- Уведомление о статусе сервера -->
-        <div class="server-status">
-            <div class="toast show" role="alert">
-                <div class="toast-header">
-                    <strong class="me-auto">Статус сервера</strong>
-                    <small>только что</small>
-                    <button type="button" class="btn-close" data-bs-dismiss="toast"></button>
+    <!-- Модальное окно для просмотра -->
+    <div class="modal fade" id="mediaModal" tabindex="-1" aria-hidden="true">
+        <div class="modal-dialog modal-xl modal-fullscreen">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h5 class="modal-title" id="mediaModalTitle">Просмотр медиа</h5>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
                 </div>
-                <div class="toast-body">
-                    <span class="badge bg-success me-2"><i class="fas fa-circle"></i></span>
-                    Система активна
+                <div class="modal-body text-center">
+                    <div id="mediaPreviewContainer">
+                        <!-- Здесь будет отображаться медиафайл -->
+                    </div>
+                </div>
+                <div class="modal-footer">
+                    <button class="btn btn-primary" onclick="downloadMedia()">
+                        <i class="fas fa-download me-2"></i>Скачать
+                    </button>
+                    <button class="btn btn-outline-secondary" data-bs-dismiss="modal">
+                        Закрыть
+                    </button>
                 </div>
             </div>
         </div>
+    </div>
 
-        <!-- JavaScript -->
-        <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
-        <script>
-        // Глобальные переменные
-        let autoRefreshInterval = null;
+    <!-- JavaScript -->
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+    <script>
+    // Глобальные переменные
+    let selectedFiles = [];
+    let currentMediaId = null;
+    
+    // Функции для вкладок
+    function showTab(tabName) {
+        // Скрыть все вкладки
+        document.getElementById('galleryTab').style.display = 'none';
+        document.getElementById('uploadTab').style.display = 'none';
+        document.getElementById('generateTab').style.display = 'none';
         
-        // Функция создания задачи
-        function createNewTask() {
-            const name = document.getElementById('taskName').value.trim();
-            const description = document.getElementById('taskDescription').value.trim();
-            const type = document.getElementById('contentType').value;
-            const priority = document.getElementById('taskPriority').value;
+        // Показать выбранную вкладку
+        document.getElementById(tabName + 'Tab').style.display = 'block';
+        
+        // Обновить активный таб в навигации
+        document.querySelectorAll('.nav-tabs .nav-link').forEach(link => {
+            link.classList.remove('active');
+        });
+        event.target.classList.add('active');
+        
+        // Если это галерея - загрузить медиа
+        if (tabName === 'gallery') {
+            loadMediaGallery();
+        }
+    }
+    
+    // Загрузка галереи медиа
+    function loadMediaGallery() {
+        fetch('/api/media')
+            .then(response => response.json())
+            .then(media => {
+                updateMediaCount(media.length);
+                renderMediaGallery(media);
+            })
+            .catch(error => {
+                console.error('Ошибка загрузки медиа:', error);
+                document.getElementById('mediaGallery').innerHTML = 
+                    '<div class="col-12 text-center"><p class="text-danger">Ошибка загрузки медиа</p></div>';
+            });
+    }
+    
+    // Обновление счетчика медиа
+    function updateMediaCount(count) {
+        document.getElementById('mediaCount').textContent = count;
+    }
+    
+    // Отрисовка галереи
+    function renderMediaGallery(media) {
+        const container = document.getElementById('mediaGallery');
+        
+        if (!media || media.length === 0) {
+            container.innerHTML = `
+                <div class="col-12 text-center py-5">
+                    <i class="fas fa-inbox fa-3x text-muted mb-3"></i>
+                    <h4 class="text-muted">Медиатека пуста</h4>
+                    <p class="text-muted mb-4">Загрузите или сгенерируйте первый файл</p>
+                    <button class="btn btn-primary" onclick="showTab('upload')">
+                        <i class="fas fa-upload me-2"></i>Загрузить файлы
+                    </button>
+                    <button class="btn btn-success ms-2" onclick="showTab('generate')">
+                        <i class="fas fa-magic me-2"></i>Сгенерировать
+                    </button>
+                </div>
+            `;
+            return;
+        }
+        
+        let html = '';
+        media.forEach(item => {
+            // Определяем иконку по типу
+            let icon = 'fa-file';
+            let badgeClass = 'bg-secondary';
             
-            if (!name) {
-                showAlert('Введите название задачи', 'warning');
-                return;
+            if (item.type === 'image') {
+                icon = 'fa-image';
+                badgeClass = 'bg-success';
+            } else if (item.type === 'video') {
+                icon = 'fa-video';
+                badgeClass = 'bg-primary';
             }
             
-            if (!description) {
-                showAlert('Введите описание задачи', 'warning');
-                return;
-            }
+            // Определяем цвет бейджа по типу контента
+            let typeBadgeClass = 'bg-info';
+            if (item.media_type === 'reference') typeBadgeClass = 'bg-warning';
+            else if (item.media_type === 'generated') typeBadgeClass = 'bg-success';
+            else if (item.media_type === 'upscaled') typeBadgeClass = 'bg-purple';
+            else if (item.media_type === 'final') typeBadgeClass = 'bg-danger';
             
-            showAlert('Создание задачи...', 'info');
+            html += `
+                <div class="col-md-3 mb-4">
+                    <div class="card media-card" data-media-id="${item.id}">
+                        <!-- Миниатюра -->
+                        <div class="media-thumbnail position-relative">
+                            ${item.thumbnail ? 
+                                `<img src="${item.thumbnail}" class="w-100 h-100" style="object-fit: cover;">` :
+                                `<i class="fas ${icon} media-icon"></i>`
+                            }
+                            
+                            <!-- Бейдж типа -->
+                            <span class="badge ${typeBadgeClass} media-badge">
+                                ${item.media_type === 'reference' ? 'Пример' : 
+                                  item.media_type === 'generated' ? 'Сген.' :
+                                  item.media_type === 'upscaled' ? 'Апск.' : 'Финальный'}
+                            </span>
+                            
+                            <!-- Действия -->
+                            <div class="media-actions">
+                                <button class="btn btn-sm btn-light" onclick="viewMedia(${item.id})" title="Просмотр">
+                                    <i class="fas fa-eye"></i>
+                                </button>
+                                <button class="btn btn-sm btn-light ms-1" onclick="downloadMedia(${item.id})" title="Скачать">
+                                    <i class="fas fa-download"></i>
+                                </button>
+                            </div>
+                        </div>
+                        
+                        <!-- Информация -->
+                        <div class="card-body">
+                            <h6 class="card-title text-truncate" title="${item.filename}">
+                                <i class="fas ${icon} me-2 text-${item.type === 'image' ? 'success' : 'primary'}"></i>
+                                ${item.filename}
+                            </h6>
+                            <p class="card-text small text-muted mb-2">
+                                ${item.description || 'Без описания'}
+                            </p>
+                            <div class="d-flex justify-content-between align-items-center">
+                                <small class="text-muted">
+                                    ${item.size || '1920x1080'}
+                                </small>
+                                <small class="text-muted">
+                                    ${new Date(item.created_at).toLocaleDateString('ru-RU')}
+                                </small>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            `;
+        });
+        
+        container.innerHTML = html;
+    }
+    
+    // Просмотр медиафайла
+    function viewMedia(mediaId) {
+        currentMediaId = mediaId;
+        
+        fetch(`/api/media/${mediaId}`)
+            .then(response => response.json())
+            .then(media => {
+                const modal = new bootstrap.Modal(document.getElementById('mediaModal'));
+                const container = document.getElementById('mediaPreviewContainer');
+                
+                document.getElementById('mediaModalTitle').textContent = media.filename;
+                
+                if (media.type === 'image') {
+                    // Для изображений
+                    container.innerHTML = `
+                        <img src="${media.path}" class="media-preview" alt="${media.filename}">
+                        <div class="mt-3">
+                            <p class="mb-2"><strong>Описание:</strong> ${media.description || 'Нет описания'}</p>
+                            <p class="mb-2"><strong>Размер:</strong> ${media.size || 'Неизвестно'}</p>
+                            <p class="mb-0"><strong>Тип:</strong> ${media.media_type === 'reference' ? 'Пример' : 'Сгенерированное'}</p>
+                        </div>
+                    `;
+                } else if (media.type === 'video') {
+                    // Для видео
+                    container.innerHTML = `
+                        <video controls class="media-preview">
+                            <source src="${media.path}" type="video/mp4">
+                            Ваш браузер не поддерживает видео.
+                        </video>
+                        <div class="mt-3">
+                            <p class="mb-2"><strong>Описание:</strong> ${media.description || 'Нет описания'}</p>
+                            <p class="mb-2"><strong>Размер:</strong> ${media.size || 'Неизвестно'}</p>
+                            <p class="mb-0"><strong>Тип:</strong> ${media.media_type === 'reference' ? 'Пример' : 'Сгенерированное'}</p>
+                        </div>
+                    `;
+                }
+                
+                modal.show();
+            })
+            .catch(error => {
+                alert('Ошибка загрузки медиафайла: ' + error);
+            });
+    }
+    
+    // Поиск медиа
+    function searchMedia() {
+        const query = document.getElementById('searchMedia').value;
+        if (!query.trim()) {
+            loadMediaGallery();
+            return;
+        }
+        
+        fetch(`/api/media/search?q=${encodeURIComponent(query)}`)
+            .then(response => response.json())
+            .then(media => {
+                renderMediaGallery(media);
+            });
+    }
+    
+    // Обработка выбора файлов
+    function handleFileSelect(files) {
+        selectedFiles = Array.from(files);
+        const container = document.getElementById('selectedFiles');
+        
+        if (selectedFiles.length === 0) {
+            container.innerHTML = '';
+            return;
+        }
+        
+        let html = '<h5>Выбранные файлы:</h5><div class="list-group">';
+        selectedFiles.forEach((file, index) => {
+            html += `
+                <div class="list-group-item">
+                    <div class="d-flex justify-content-between align-items-center">
+                        <div>
+                            <i class="fas ${file.type.startsWith('image') ? 'fa-image text-success' : 
+                                          file.type.startsWith('video') ? 'fa-video text-primary' : 'fa-file'} me-2"></i>
+                            ${file.name} (${(file.size / 1024 / 1024).toFixed(2)} MB)
+                        </div>
+                        <button class="btn btn-sm btn-danger" onclick="removeFile(${index})">
+                            <i class="fas fa-times"></i>
+                        </button>
+                    </div>
+                </div>
+            `;
+        });
+        html += '</div>';
+        
+        container.innerHTML = html;
+    }
+    
+    // Удаление файла из списка
+    function removeFile(index) {
+        selectedFiles.splice(index, 1);
+        handleFileSelect(selectedFiles);
+    }
+    
+    // Загрузка файлов на сервер
+    function uploadFiles() {
+        if (selectedFiles.length === 0) {
+            alert('Выберите файлы для загрузки');
+            return;
+        }
+        
+        const description = document.getElementById('fileDescription').value;
+        const mediaType = document.getElementById('mediaType').value;
+        
+        document.getElementById('uploadProgress').style.display = 'block';
+        document.getElementById('uploadStatus').textContent = 'Начинаю загрузку...';
+        
+        let uploadedCount = 0;
+        const totalFiles = selectedFiles.length;
+        
+        selectedFiles.forEach(file => {
+            const formData = new FormData();
+            formData.append('file', file);
+            formData.append('description', description);
+            formData.append('media_type', mediaType);
             
-            fetch('/api/tasks', {
+            fetch('/api/media/upload', {
                 method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({
-                    name: name,
-                    description: description,
-                    type: type,
-                    priority: priority
-                })
+                body: formData
             })
             .then(response => response.json())
             .then(data => {
-                if (data.success) {
-                    showAlert(`Задача #${data.task.id} создана успешно!`, 'success');
-                    document.getElementById('taskName').value = '';
-                    document.getElementById('taskDescription').value = '';
-                    loadAllTasks();
-                    updateStats();
-                } else {
-                    showAlert('Ошибка: ' + data.error, 'danger');
+                uploadedCount++;
+                const progress = Math.round((uploadedCount / totalFiles) * 100);
+                
+                document.querySelector('#uploadProgress .progress-bar').style.width = progress + '%';
+                document.getElementById('uploadStatus').textContent = 
+                    `Загружено ${uploadedCount} из ${totalFiles} файлов`;
+                
+                if (uploadedCount === totalFiles) {
+                    document.getElementById('uploadStatus').innerHTML = 
+                        '<span class="text-success">✅ Все файлы загружены!</span>';
+                    
+                    // Очистить форму
+                    selectedFiles = [];
+                    document.getElementById('selectedFiles').innerHTML = '';
+                    document.getElementById('fileDescription').value = '';
+                    
+                    // Показать галерею
+                    setTimeout(() => {
+                        showTab('gallery');
+                    }, 2000);
                 }
             })
             .catch(error => {
-                showAlert('Ошибка сети: ' + error, 'danger');
+                console.error('Ошибка загрузки:', error);
+                document.getElementById('uploadStatus').innerHTML = 
+                    `<span class="text-danger">❌ Ошибка загрузки файла ${file.name}</span>`;
             });
-        }
-        
-        // Загрузка всех задач
-        function loadAllTasks() {
-            fetch('/api/tasks')
-            .then(response => response.json())
-            .then(tasks => {
-                renderTasksList(tasks);
-            })
-            .catch(error => {
-                console.error('Ошибка загрузки задач:', error);
-            });
-        }
-        
-        // Отображение списка задач
-        function renderTasksList(tasks) {
-            const container = document.getElementById('tasksList');
-            
-            if (!tasks || tasks.length === 0) {
-                container.innerHTML = `
-                    <div class="text-center py-5">
-                        <i class="fas fa-inbox fa-3x text-muted mb-3"></i>
-                        <p class="text-muted">Нет активных задач</p>
-                        <button class="btn btn-primary" onclick="createNewTask()">
-                            <i class="fas fa-plus me-1"></i>Создать первую задачу
-                        </button>
-                    </div>
-                `;
-                return;
-            }
-            
-            let html = '';
-            tasks.forEach(task => {
-                // Определяем цвет статуса
-                let statusClass = 'secondary';
-                let statusIcon = 'fa-clock';
-                
-                if (task.status === 'completed') {
-                    statusClass = 'success';
-                    statusIcon = 'fa-check-circle';
-                } else if (task.status === 'running') {
-                    statusClass = 'primary';
-                    statusIcon = 'fa-spinner fa-spin';
-                } else if (task.status === 'failed') {
-                    statusClass = 'danger';
-                    statusIcon = 'fa-exclamation-triangle';
-                }
-                
-                // Форматируем время
-                const createdTime = new Date(task.created_at).toLocaleTimeString('ru-RU');
-                const updatedTime = new Date(task.updated_at).toLocaleTimeString('ru-RU');
-                
-                html += `
-                    <div class="task-item card mb-3">
-                        <div class="card-body">
-                            <div class="d-flex justify-content-between align-items-start mb-2">
-                                <div>
-                                    <h5 class="card-title mb-1">${task.name}</h5>
-                                    <div class="small text-muted mb-2">
-                                        <span class="me-3"><i class="fas fa-tag me-1"></i>${task.type}</span>
-                                        <span><i class="fas fa-calendar me-1"></i>${createdTime}</span>
-                                    </div>
-                                </div>
-                                <div>
-                                    <span class="badge bg-${statusClass}">
-                                        <i class="fas ${statusIcon} me-1"></i>${task.status}
-                                    </span>
-                                </div>
-                            </div>
-                            
-                            <p class="card-text small text-muted mb-3">${task.description || 'Без описания'}</p>
-                            
-                            <!-- Шаги выполнения -->
-                            ${task.steps && task.steps.length > 0 ? `
-                                <div class="mb-3">
-                                    <small class="text-muted d-block mb-1">Выполненные шаги:</small>
-                                    <div>
-                                        ${task.steps.map(step => 
-                                            `<span class="badge bg-light text-dark step-badge">${step}</span>`
-                                        ).join('')}
-                                    </div>
-                                </div>
-                            ` : ''}
-                            
-                            <!-- Прогресс -->
-                            <div class="mb-3">
-                                <div class="d-flex justify-content-between mb-1">
-                                    <small>Прогресс выполнения</small>
-                                    <small>${task.progress}%</small>
-                                </div>
-                                <div class="progress">
-                                    <div class="progress-bar bg-${statusClass}" 
-                                         style="width: ${task.progress}%">
-                                    </div>
-                                </div>
-                            </div>
-                            
-                            <div class="d-flex justify-content-between align-items-center">
-                                <small class="text-muted">
-                                    <i class="fas fa-sync-alt me-1"></i>Обновлено: ${updatedTime}
-                                </small>
-                                <div>
-                                    <button class="btn btn-sm btn-outline-primary" onclick="viewTaskDetails(${task.id})">
-                                        <i class="fas fa-eye"></i>
-                                    </button>
-                                    ${task.status === 'running' ? `
-                                        <button class="btn btn-sm btn-outline-danger ms-1" onclick="cancelTask(${task.id})">
-                                            <i class="fas fa-stop"></i>
-                                        </button>
-                                    ` : ''}
-                                </div>
-                            </div>
-                        </div>
-                    </div>
-                `;
-            });
-            
-            container.innerHTML = html;
-        }
-        
-        // Обновление статистики
-        function updateStats() {
-            fetch('/api/stats')
-            .then(response => response.json())
-            .then(stats => {
-                document.getElementById('totalTasks').textContent = stats.total_tasks;
-                document.getElementById('completedTasks').textContent = stats.completed;
-                document.getElementById('runningTasks').textContent = stats.running;
-                
-                const successRate = stats.total_tasks > 0 
-                    ? Math.round((stats.completed / stats.total_tasks) * 100) 
-                    : 0;
-                document.getElementById('successRate').textContent = successRate + '%';
-            });
-        }
-        
-        // Просмотр деталей задачи
-        function viewTaskDetails(taskId) {
-            fetch(`/api/tasks/${taskId}`)
-            .then(response => response.json())
-            .then(task => {
-                let resultInfo = 'Нет результатов';
-                if (task.result) {
-                    if (typeof task.result === 'string') {
-                        try {
-                            const result = JSON.parse(task.result);
-                            resultInfo = JSON.stringify(result, null, 2);
-                        } catch {
-                            resultInfo = task.result;
-                        }
-                    } else {
-                        resultInfo = JSON.stringify(task.result, null, 2);
-                    }
-                }
-                
-                alert(`Детали задачи #${task.id}\n\n` +
-                      `Название: ${task.name}\n` +
-                      `Тип: ${task.type}\n` +
-                      `Статус: ${task.status}\n` +
-                      `Прогресс: ${task.progress}%\n` +
-                      `Создана: ${new Date(task.created_at).toLocaleString('ru-RU')}\n` +
-                      `Результат:\n${resultInfo}`);
-            });
-        }
-        
-        // Отмена задачи
-        function cancelTask(taskId) {
-            if (confirm('Вы уверены, что хотите отменить эту задачу?')) {
-                fetch(`/api/tasks/${taskId}/cancel`, {
-                    method: 'POST'
-                })
-                .then(response => response.json())
-                .then(data => {
-                    if (data.success) {
-                        showAlert('Задача отменена', 'success');
-                        loadAllTasks();
-                        updateStats();
-                    }
-                });
-            }
-        }
-        
-        // Очистка всех задач
-        function clearAllTasks() {
-            if (confirm('ВНИМАНИЕ! Это удалит ВСЕ задачи. Продолжить?')) {
-                fetch('/api/tasks/clear', {
-                    method: 'POST'
-                })
-                .then(response => response.json())
-                .then(data => {
-                    if (data.success) {
-                        showAlert('Все задачи удалены', 'success');
-                        loadAllTasks();
-                        updateStats();
-                    }
-                });
-            }
-        }
-        
-        // Всплывающие уведомления
-        function showAlert(message, type) {
-            const alertDiv = document.createElement('div');
-            alertDiv.className = `alert alert-${type} alert-dismissible fade show position-fixed`;
-            alertDiv.style.cssText = `
-                top: 80px;
-                right: 20px;
-                z-index: 9999;
-                min-width: 300px;
-                box-shadow: 0 5px 15px rgba(0,0,0,0.2);
-            `;
-            alertDiv.innerHTML = `
-                ${message}
-                <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
-            `;
-            
-            document.body.appendChild(alertDiv);
-            
-            setTimeout(() => {
-                if (alertDiv.parentNode) {
-                    alertDiv.classList.remove('show');
-                    setTimeout(() => alertDiv.remove(), 300);
-                }
-            }, 5000);
-        }
-        
-        // Автоматическое обновление
-        function startAutoRefresh() {
-            if (autoRefreshInterval) clearInterval(autoRefreshInterval);
-            
-            autoRefreshInterval = setInterval(() => {
-                loadAllTasks();
-                updateStats();
-            }, 10000); // Каждые 10 секунд
-        }
-        
-        // Инициализация при загрузке страницы
-        document.addEventListener('DOMContentLoaded', function() {
-            loadAllTasks();
-            updateStats();
-            startAutoRefresh();
-            
-            // Обновляем время каждую минуту
-            setInterval(() => {
-                const now = new Date();
-                document.getElementById('serverStatus').innerHTML = 
-                    `<i class="fas fa-server me-1"></i>Nginx + Flask | ${now.toLocaleTimeString('ru-RU')}`;
-            }, 60000);
         });
-        </script>
-    </body>
-    </html>
-    '''
+    }
+    
+    // Генерация контента
+    function generateContent() {
+        const prompt = document.getElementById('generatePrompt').value;
+        const type = document.getElementById('generateType').value;
+        const count = document.getElementById('generateCount').value;
+        
+        if (!prompt.trim()) {
+            alert('Введите описание для генерации');
+            return;
+        }
+        
+        document.getElementById('generateProgress').style.display = 'block';
+        document.getElementById('generateStatus').textContent = 'Начинаю генерацию...';
+        
+        fetch('/api/media/generate', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({
+                prompt: prompt,
+                type: type,
+                count: parseInt(count)
+            })
+        })
+        .then(response => response.json())
+        .then(data => {
+            if (data.success) {
+                // Симуляция прогресса генерации
+                let progress = 0;
+                const interval = setInterval(() => {
+                    progress += 10;
+                    document.querySelector('#generateProgress .progress-bar').style.width = progress + '%';
+                    document.getElementById('generateStatus').textContent = 
+                        `Генерация... ${progress}%`;
+                    
+                    if (progress >= 100) {
+                        clearInterval(interval);
+                        document.getElementById('generateStatus').innerHTML = 
+                            '<span class="text-success">✅ Генерация завершена!</span>';
+                        
+                        // Показать галерею
+                        setTimeout(() => {
+                            showTab('gallery');
+                            loadMediaGallery();
+                        }, 2000);
+                    }
+                }, 500);
+            } else {
+                document.getElementById('generateStatus').innerHTML = 
+                    `<span class="text-danger">❌ Ошибка: ${data.error}</span>`;
+            }
+        })
+        .catch(error => {
+            document.getElementById('generateStatus').innerHTML = 
+                `<span class="text-danger">❌ Ошибка сети: ${error}</span>`;
+        });
+    }
+    
+    // Скачивание медиафайла
+    function downloadMedia(mediaId) {
+        if (!mediaId && currentMediaId) {
+            mediaId = currentMediaId;
+        }
+        
+        if (mediaId) {
+            window.open(`/api/media/${mediaId}/download`, '_blank');
+        }
+    }
+    
+    // Инициализация при загрузке страницы
+    document.addEventListener('DOMContentLoaded', function() {
+        loadMediaGallery();
+        
+        // Добавляем обработчик перетаскивания файлов
+        const uploadArea = document.querySelector('.upload-area');
+        uploadArea.addEventListener('dragover', (e) => {
+            e.preventDefault();
+            uploadArea.style.borderColor = '#4361ee';
+            uploadArea.style.backgroundColor = 'rgba(67, 97, 238, 0.1)';
+        });
+        
+        uploadArea.addEventListener('dragleave', () => {
+            uploadArea.style.borderColor = '#dee2e6';
+            uploadArea.style.backgroundColor = '';
+        });
+        
+        uploadArea.addEventListener('drop', (e) => {
+            e.preventDefault();
+            uploadArea.style.borderColor = '#dee2e6';
+            uploadArea.style.backgroundColor = '';
+            
+            if (e.dataTransfer.files.length > 0) {
+                handleFileSelect(e.dataTransfer.files);
+            }
+        });
+    });
+    </script>
+</body>
+</html>
+'''
 
 # ==================== API ЭНДПОИНТЫ ====================
 
-@app.route('/api/stats')
-def get_stats():
-    """Получение статистики"""
-    stats = task_manager.get_stats()
-    return jsonify(stats)
+@app.route('/')
+def index():
+    """Главная страница"""
+    return HTML_TEMPLATE
 
-@app.route('/api/tasks', methods=['GET', 'POST'])
-def tasks_api():
-    """Управление задачами"""
-    if request.method == 'GET':
-        tasks = task_manager.get_all_tasks()
-        return jsonify(tasks)
-    
-    elif request.method == 'POST':
+@app.route('/api/media')
+def get_all_media():
+    """Получение всех медиафайлов"""
+    media = db.get_all_media()
+    return jsonify(media)
+
+@app.route('/api/media/<int:media_id>')
+def get_media_by_id(media_id):
+    """Получение конкретного медиафайла"""
+    media = db.get_media(media_id)
+    if media:
+        return jsonify(media)
+    return jsonify({'error': 'Медиафайл не найден'}), 404
+
+@app.route('/api/media/search')
+def search_media():
+    """Поиск медиафайлов"""
+    query = request.args.get('q', '')
+    results = db.search_media(query)
+    return jsonify(results)
+
+@app.route('/api/media/upload', methods=['POST'])
+def upload_media():
+    """Загрузка медиафайла"""
+    try:
+        if 'file' not in request.files:
+            return jsonify({'error': 'Файл не найден'}), 400
+        
+        file = request.files['file']
+        if file.filename == '':
+            return jsonify({'error': 'Файл не выбран'}), 400
+        
+        # Безопасное имя файла
+        filename = secure_filename(file.filename)
+        
+        # Сохраняем файл
+        filepath = BASE_DIR / 'data' / 'uploads' / filename
+        file.save(filepath)
+        
+        # Добавляем в базу данных
+        description = request.form.get('description', '')
+        media_type = request.form.get('media_type', 'generated')
+        
+        media_item = db.add_media(filename, media_type, description)
+        
+        return jsonify({
+            'success': True,
+            'media': media_item,
+            'message': 'Файл успешно загружен'
+        })
+        
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/media/generate', methods=['POST'])
+def generate_media():
+    """Генерация медиаконтента"""
+    try:
         data = request.json
+        prompt = data.get('prompt', '')
+        media_type = data.get('type', 'image')
+        count = data.get('count', 4)
         
-        if not data.get('name'):
-            return jsonify({'success': False, 'error': 'Не указано название задачи'}), 400
+        if not prompt:
+            return jsonify({'error': 'Не указан промпт для генерации'}), 400
         
-        task = task_manager.create_task(
-            name=data['name'],
-            task_type=data.get('type', 'image'),
-            description=data.get('description', '')
-        )
+        # В реальном приложении здесь будет вызов AI API
+        # Пока создаем тестовые медиафайлы
         
-        return jsonify({'success': True, 'task': task})
+        generated_items = []
+        for i in range(count):
+            if media_type == 'image':
+                filename = f"generated_{int(time.time())}_{i}.jpg"
+                description = f"Сгенерированное изображение: {prompt}"
+            else:
+                filename = f"generated_{int(time.time())}_{i}.mp4"
+                description = f"Сгенерированное видео: {prompt}"
+            
+            # Добавляем в базу данных
+            media_item = db.add_media(filename, 'generated', description)
+            generated_items.append(media_item)
+            
+            # Создаем тестовый файл (заглушку)
+            test_file = BASE_DIR / 'data' / 'uploads' / filename
+            with open(test_file, 'w') as f:
+                f.write(f"Test {media_type} file - {prompt}")
+        
+        return jsonify({
+            'success': True,
+            'generated': generated_items,
+            'message': f'Сгенерировано {count} {media_type} файлов'
+        })
+        
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
-@app.route('/api/tasks/<int:task_id>')
-def get_task_api(task_id):
-    """Получение конкретной задачи"""
-    task = task_manager.get_task(task_id)
-    if task:
-        return jsonify(task)
-    return jsonify({'error': 'Задача не найдена'}), 404
-
-@app.route('/api/tasks/<int:task_id>/cancel', methods=['POST'])
-def cancel_task_api(task_id):
-    """Отмена задачи"""
-    if task_manager.update_task(task_id, status='cancelled'):
-        return jsonify({'success': True})
-    return jsonify({'success': False, 'error': 'Задача не найдена'}), 404
-
-@app.route('/api/tasks/clear', methods=['POST'])
-def clear_tasks_api():
-    """Очистка всех задач"""
-    # В реальном приложении нужно архивировать, а не удалять
-    task_manager.tasks = {"tasks": [], "next_id": 1, "stats": {}}
-    task_manager._save_db()
+@app.route('/api/media/<int:media_id>/download')
+def download_media(media_id):
+    """Скачивание медиафайла"""
+    media = db.get_media(media_id)
+    if not media:
+        return jsonify({'error': 'Файл не найден'}), 404
     
-    # Создаем системную задачу
-    task_manager.create_task("Система очищена", "system", "Все задачи были очищены администратором")
+    filepath = BASE_DIR / 'data' / 'uploads' / media['filename']
+    if not filepath.exists():
+        return jsonify({'error': 'Файл не существует на сервере'}), 404
     
-    return jsonify({'success': True, 'message': 'Все задачи очищены'})
+    return send_from_directory(
+        BASE_DIR / 'data' / 'uploads',
+        media['filename'],
+        as_attachment=True,
+        download_name=media['filename']
+    )
 
-# Статические файлы
 @app.route('/static/<path:filename>')
 def serve_static(filename):
-    return send_from_directory(STATIC_DIR, filename)
+    """Сервис статических файлов"""
+    return send_from_directory(BASE_DIR / 'static', filename)
 
-@app.route('/data/<path:filename>')
-def serve_data(filename):
-    return send_from_directory(DATA_DIR, filename)
+@app.route('/data/uploads/<path:filename>')
+def serve_upload(filename):
+    """Сервис загруженных файлов"""
+    return send_from_directory(BASE_DIR / 'data' / 'uploads', filename)
 
 # ==================== ЗАПУСК СЕРВЕРА ====================
 
-def run_gunicorn():
-    """Запуск через Gunicorn (для production)"""
-    try:
-        import gunicorn.app.base
-        from gunicorn.six import iteritems
-        
-        class StandaloneApplication(gunicorn.app.base.BaseApplication):
-            def __init__(self, app, options=None):
-                self.options = options or {}
-                self.application = app
-                super().__init__()
-            
-            def load_config(self):
-                config = {key: value for key, value in iteritems(self.options)
-                         if key in self.cfg.settings and value is not None}
-                for key, value in iteritems(config):
-                    self.cfg.set(key.lower(), value)
-            
-            def load(self):
-                return self.application
-        
-        options = {
-            'bind': '127.0.0.1:8000',
-            'workers': 4,
-            'worker_class': 'sync',
-            'timeout': 120,
-            'accesslog': 'access.log',
-            'errorlog': 'error.log',
-            'loglevel': 'info'
-        }
-        
-        StandaloneApplication(app, options).run()
-        
-    except ImportError:
-        logger.warning("Gunicorn не установлен. Запускаю в режиме разработки.")
-        app.run(host='0.0.0.0', port=8000, debug=True)
-
 if __name__ == '__main__':
-    logger.info("=" * 60)
-    logger.info("🚀 Media Automation System - Production Version")
-    logger.info("=" * 60)
-    logger.info("Режимы запуска:")
-    logger.info("  1. Для разработки: python app_nginx.py")
-    logger.info("  2. Для production: gunicorn app_nginx:app")
-    logger.info("")
-    logger.info("📁 Структура:")
-    logger.info(f"  • База данных: {DATA_DIR / 'tasks_db.json'}")
-    logger.info(f"  • Выходные данные: {OUTPUTS_DIR}")
-    logger.info(f"  • Логи: media_automation.log")
-    logger.info("=" * 60)
+    # Добавляем тестовые данные
+    if len(db.get_all_media()) == 0:
+        test_media = [
+            ("example1.jpg", "reference", "Пример пейзажа с горами"),
+            ("example2.jpg", "reference", "Пример портрета с хорошим освещением"),
+            ("generated1.jpg", "generated", "Сгенерированный космический пейзаж"),
+            ("generated2.mp4", "generated", "Сгенерированное видео анимации"),
+            ("upscaled1.jpg", "upscaled", "Апскейлированное изображение 4K"),
+            ("final_video.mp4", "final", "Финальный ролик для публикации")
+        ]
+        
+        for filename, media_type, description in test_media:
+            db.add_media(filename, media_type, description)
     
-    # Запуск в режиме разработки
-    app.run(host='0.0.0.0', port=8000, debug=False)
+    print("=" * 60)
+    print("🎬 MEDIA AUTOMATION SYSTEM - ПРОСМОТР МЕДИА")
+    print("=" * 60)
+    print("📁 Папки созданы:")
+    print(f"  • Загрузки: {BASE_DIR / 'data' / 'uploads'}")
+    print(f"  • Статика: {BASE_DIR / 'static'}")
+    print(f"  • Миниатюры: {BASE_DIR / 'static' / 'thumbnails'}")
+    print("")
+    print("🌐 Запуск:")
+    print("  1. Установите Flask: pip install flask")
+    print("  2. Запустите: python app_nginx.py")
+    print("  3. Откройте: http://localhost:8000")
+    print("")
+    print("👁 Функции:")
+    print("  • Просмотр картинок и видео")
+    print("  • Загрузка файлов")
+    print("  • Генерация контента")
+    print("  • Поиск по медиатеке")
+    print("=" * 60)
+    
+    app.run(host='0.0.0.0', port=8000, debug=True)
